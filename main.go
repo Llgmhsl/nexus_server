@@ -22,9 +22,11 @@ import (
 	"os/signal"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
+	"golang.org/x/time/rate" // 新增限流库
 	"gopkg.in/yaml.v3"
 
 	"github.com/gin-gonic/gin"
@@ -45,6 +47,12 @@ var db *database.Database
 // 定义全局信号量（最大并发数）
 const maxConcurrent = 20 // 最大并发数
 var sem = make(chan struct{}, maxConcurrent)
+
+// 新增全局节点限流器
+var (
+	nodeLimiters = make(map[string]*rate.Limiter) // 节点ID -> 限速器
+	limiterMu    sync.Mutex                       // 保护映射的互斥锁
+)
 
 // 解析单行节点数据
 func parseNodeLine(line string) (*gen.Node, error) {
@@ -286,6 +294,24 @@ func worker(ctx context.Context, No string) {
 				continue
 			}
 			node := nodes.GetNextNode()
+			
+			// ==================== 新增限流逻辑 ====================
+			// 获取或创建节点的限速器（180秒内仅允许1次请求）
+			limiterMu.Lock()
+			limiter, exists := nodeLimiters[node.NodeId]
+			if !exists {
+				// 每180秒生成1个令牌，桶容量为1
+				limiter = rate.NewLimiter(rate.Every(180*time.Second), 1)
+				nodeLimiters[node.NodeId] = limiter
+			}
+			limiterMu.Unlock()
+			
+			// 等待限速器允许（180秒内仅允许1次）
+			if err := limiter.Wait(ctx); err != nil {
+				continue // 若上下文取消则退出
+			}
+			// ==================== 限流逻辑结束 ====================
+			
 			node_key := GenKey()
 			log.Println("线程" + No + " 节点" + node.NodeId + " 获取任务...")
 			r := c.R()
