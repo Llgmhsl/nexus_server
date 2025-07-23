@@ -26,7 +26,7 @@ import (
 	"syscall"
 	"time"
 
-	"golang.org/x/time/rate" // 新增限流库
+	"golang.org/x/time/rate" // 限流库
 	"gopkg.in/yaml.v3"
 
 	"github.com/gin-gonic/gin"
@@ -84,7 +84,7 @@ func parseNodeLine(line string) (*gen.Node, error) {
 	}, nil
 }
 
-// 工作协程函数
+// 工作协程函数 - 只加载两个节点
 func getNodes(address string) bool {
 	log.Println("读取节点列表...")
 
@@ -105,8 +105,6 @@ func getNodes(address string) bool {
 			c.SetCommonHeader("Referer", "https://app.nexus.xyz/")
 			c.SetTimeout(time.Duration(120) * time.Second)
 
-			// c.SetProxyURL("http://127.0.0.1:2025")
-
 			r := c.R()
 			resp, err := r.Send("GET", "https://beta.orchestrator.nexus.xyz/v3/users/"+address)
 			if err != nil {
@@ -124,41 +122,25 @@ func getNodes(address string) bool {
 				log.Println("读取节点失败：", string(bin))
 				return false
 			}
+			
+			// 只取前两个节点
 			line := ""
-			for i := 0; i < len(res.Nodes); i++ {
+			count := 0
+			for i := 0; i < len(res.Nodes) && count < 2; i++ {
 				line += res.Nodes[i].GetNodeId() + "=" + res.Nodes[i].GetNodeType().String() + "\n"
+				count++
 			}
 
-			nodes.StoreNodes(res)
-			count := len(res.Nodes)
-			if len(res.Nodes) == 50 {
-				resp2, err := r.Send("GET", "https://beta.orchestrator.nexus.xyz/v3/nodes/"+res.UserId+"/"+res.Nodes[len(res.Nodes)-1].NodeId)
-				if err != nil {
-					log.Println("读取节点失败，重新尝试...")
-					resp2, err = r.Send("GET", "https://beta.orchestrator.nexus.xyz/v3/nodes/"+res.UserId+"/"+res.Nodes[len(res.Nodes)-1].NodeId)
-					if err != nil {
-						log.Println("读取节点失败：", err)
-						return false
-					}
-				}
-				res2 := &gen.UserResponse{}
-				bin = resp2.Bytes()
-				err = proto.Unmarshal(bin, res2)
-				if err != nil {
-					log.Println("读取节点失败：", string(bin))
-					return false
-				}
-				nodes.StoreNodes(res2)
-				count += len(res2.Nodes)
-
-				for i := 0; i < len(res2.Nodes); i++ {
-					line += res2.Nodes[i].GetNodeId() + "=" + res2.Nodes[i].GetNodeType().String() + "\n"
-				}
-
+			// 只存储两个节点
+			var limitedNodes []*gen.Node
+			for i := 0; i < len(res.Nodes) && i < 2; i++ {
+				limitedNodes = append(limitedNodes, res.Nodes[i])
 			}
+			nodes.StoreNodes(&gen.UserResponse{Nodes: limitedNodes})
+			
 			log.Println("读取到节点节点数量：", count)
-			if count <= 10 {
-				log.Println("节点节点数量不足10个，请创建节点后再运行！")
+			if count < 2 {
+				log.Println("节点节点数量不足2个，请创建节点后再运行！")
 				return false
 			}
 			// 写出缓存
@@ -186,7 +168,8 @@ func getNodes(address string) bool {
 
 	scanner := bufio.NewScanner(file)
 	lineNum := 0
-	for scanner.Scan() {
+	nodeCount := 0
+	for scanner.Scan() && nodeCount < 2 { // 只读取两个节点
 		lineNum++
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
@@ -202,12 +185,19 @@ func getNodes(address string) bool {
 
 		// 添加到缓存
 		nodeList = append(nodeList, node)
+		nodeCount++
 	}
 
 	if err := scanner.Err(); err != nil {
 		log.Println("检查缓存失败，请检查程序权限！", err)
 		return false
 	}
+	
+	if len(nodeList) < 2 {
+		log.Printf("缓存文件中有效节点数量不足2个，请删除缓存文件重新获取节点列表。")
+		return false
+	}
+	
 	nodes.StoreNodesUseList(nodeList)
 	log.Printf("成功从缓存文件加载 %d 个节点，如果删除了或者更新了节点，请删除缓存文件以获取最新的节点列表。\n", len(nodeList))
 	return true
@@ -261,8 +251,6 @@ func CreateTask(programID, publicInputs, taskID, signKey string) error {
 		return fmt.Errorf("failed to create task: %w", err)
 	}
 
-	// 在数据库创建成功后输出信息
-	// fmt.Printf("Task created successfully! \nTask ID: %s\n", taskID)
 	return nil
 }
 
@@ -279,8 +267,6 @@ func worker(ctx context.Context, No string) {
 	c.SetCommonHeader("Referer", "https://app.nexus.xyz/")
 	c.SetTimeout(time.Duration(120) * time.Second)
 
-	// c.SetProxyURL("http://127.0.0.1:2025")
-
 	for {
 		select {
 		case <-ctx.Done():
@@ -289,7 +275,6 @@ func worker(ctx context.Context, No string) {
 			// 准备请求
 			queue := db.GetTaskCount("pending")
 			if queue >= config.Queue {
-				// log.Println("线程" + No + " 待处理任务：" + strconv.Itoa(queue) + "，队列过多，暂不获取任务！")
 				time.Sleep(10 * time.Second)
 				continue
 			}
@@ -330,14 +315,10 @@ func worker(ctx context.Context, No string) {
 			bin := resp.Bytes()
 
 			if strings.Contains(string(bin), "Node has too many tasks") {
-				// log.Println("线程"+No+" 节点"+node.NodeId+" 获取任务失败：", string(bin))
 				log.Println("线程" + No + " 节点" + node.NodeId + " 获取任务失败：节点任务过多，该节点已无法使用，可进行删除，删除后需重启服务端。")
-
 				continue
 			} else if strings.Contains(string(bin), "Node not found") {
-				// log.Println("线程"+No+" 节点"+node.NodeId+" 获取任务失败：", string(bin))
 				log.Println("线程" + No + " 节点" + node.NodeId + " 获取任务失败：节点未找到，如果进行了节点删除和添加，需要重启服务端。")
-
 				continue
 			} else if strings.Contains(string(bin), "Rate limit exceeded for node") {
 				log.Println("线程" + No + " 节点" + node.NodeId + " 获取任务失败：429错误，获取任务频繁，尝试增加节点数量、钱包数量，减少任务读取线程，队列长度。")
@@ -371,9 +352,6 @@ func main() {
 	file, err := os.ReadFile("./nexus_server.txt")
 	if err != nil {
 		log.Println("无配置文件或配置文件错误，已使用默认配置，请前往控制面板设置钱包地址！")
-		// fmt.Printf("读取配置文件失败: %v\n", err)
-		// scanner := bufio.NewScanner(os.Stdin)
-		// scanner.Scan()
 		config = Config{
 			Host:    "127.0.0.1",
 			Address: "",
@@ -443,7 +421,6 @@ func main() {
 		// 设置HTTP路由
 		router := setupRouter(taskHandler)
 		// 启动服务
-		// fmt.Println("Server running on :")
 		log.Println("节点服务端启动，运行端口：", config.Port)
 		go func() {
 			time.Sleep(3 * time.Second)
@@ -490,19 +467,15 @@ func setupRouter(handler *handlers.TaskHandler) *gin.Engine {
 	router.Use(gin.LoggerWithConfig(gin.LoggerConfig{
 		Output: nil, // 禁用日志输出
 	}))
-	// 加载模板
 	// 注册并发限制中间件
 	router.Use(concurrencyLimitMiddleware())
 
 	router.SetHTMLTemplate(template.Must(template.New("").ParseFS(htmlFS, "templates/*")))
-	// 推荐：引入js css等  例如j.js  访问地址为 localhost:8080/asset/j.js
 	router.Any("/static/*filepath", func(c *gin.Context) {
 		staticServer := http.FileServer(http.FS(assetFS))
 		staticServer.ServeHTTP(c.Writer, c.Request)
 	})
 
-	// router.LoadHTMLGlob("./templates/*")
-	// router.Static("/static", "./static")
 	router.GET("/", func(c *gin.Context) {
 		c.HTML(200, "index.html", nil)
 	})
@@ -559,17 +532,12 @@ func setupRouter(handler *handlers.TaskHandler) *gin.Engine {
 	// 任务管理API
 	taskGroup := router.Group("/tasks")
 	{
-		// taskGroup.POST("", handler.CreateTask)
 		taskGroup.DELETE("", handler.DeleteTask)
-
-		// 新增API端点
 		taskGroup.GET("/getTaskStats", handler.GetTaskStats) // 获取任务状态
 		taskGroup.GET("/pick", handler.PickTask)             // 提取任务
 		taskGroup.POST("/submit", handler.SubmitResult)      // 提交任务结果
-
 		taskGroup.POST("/clientHeart", handler.ClientHeart)   // 客户端心跳
 		taskGroup.GET("/clientList", handler.GetClientStates) // 获取客户端状态
-
 	}
 
 	return router
